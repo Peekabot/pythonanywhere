@@ -1,0 +1,31 @@
+name: Deploy to PythonAnywhere
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger deploy on PythonAnywhere
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            "https://peakbot.pythonanywhere.com/deploy" \
+            -H "Authorization: Bearer ${{ secrets.DEPLOY_SECRET }}" \
+            -H "Content-Type: application/json")
+          echo "Response code: $RESPONSE"
+          if [ "$RESPONSE" != "200" ]; then
+            echo "Deploy failed with HTTP $RESPONSE"
+            exit 1
+          fi
+          echo "Deploy triggered successfully."
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Deploy failed. Check:"
+          echo "  - DEPLOY_SECRET secret is set in GitHub repo settings"
+          echo "  - Bot is running on PythonAnywhere"
+          echo "  - https://peakbot.pythonanywhere.com/health is reachable"

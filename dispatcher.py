@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
 NULLCLAW Dispatcher Bot
-Crew job dispatch bot for Telegram
+Crew job dispatch bot for Telegram with Claude AI integration.
 
 Commands:
-  /new <service> "<name>" "<destination>" <amount>  - Post a new job
+  /new <service> "<name>" "<destination>" <amount>  - Post a new job (or describe it naturally)
   /complete <JOB_ID>                                - Mark job complete
   /stats                                            - Show earnings & stats
   /list                                             - Show pending jobs
+  /ask <question>                                   - Ask Claude anything
   /help                                             - Show help
+
+Endpoints:
+  POST /webhook/<token>   - Telegram webhook
+  POST /deploy            - GitHub Actions auto-deploy (requires DEPLOY_SECRET)
+  GET  /health            - Health check
 """
 
 import os
@@ -16,17 +22,32 @@ import json
 import time
 import shlex
 import logging
+import subprocess
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
+
+try:
+    import anthropic
+    CLAUDE_AVAILABLE = True
+except ImportError:
+    CLAUDE_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 CREW_CHAT_ID = os.environ.get('CREW_CHAT_ID', '')
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+DEPLOY_SECRET = os.environ.get('DEPLOY_SECRET', '')
+
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-JOBS_FILE = os.path.join(os.path.dirname(__file__), 'jobs.json')
+JOBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jobs.json')
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+WSGI_FILE = os.environ.get(
+    'WSGI_FILE',
+    '/var/www/peakbot_pythonanywhere_com_wsgi.py'
+)
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -34,6 +55,15 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Claude client (lazy init)
+_claude = None
+
+def get_claude():
+    global _claude
+    if _claude is None and CLAUDE_AVAILABLE and ANTHROPIC_API_KEY:
+        _claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _claude
 
 
 # ---------------------------------------------------------------------------
@@ -52,8 +82,68 @@ def save_jobs(jobs):
 
 
 def generate_job_id():
-    # Last 6 digits of millisecond timestamp
     return f"JOB_{str(int(time.time() * 1000))[-6:]}"
+
+
+# ---------------------------------------------------------------------------
+# Claude AI helpers
+# ---------------------------------------------------------------------------
+def parse_job_with_claude(text):
+    """
+    Use Claude to extract structured job data from natural language.
+    Returns dict with keys: service, driver, destination, amount
+    or None if parsing fails.
+    """
+    claude = get_claude()
+    if not claude:
+        return None
+    try:
+        msg = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            system="You are a dispatcher assistant. Extract job details from text.",
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Extract job details from this text and return ONLY valid JSON "
+                    f"with keys: service, driver, destination, amount (number).\n"
+                    f"Text: {text}\n"
+                    f'Example: {{"service": "uber", "driver": "Sarah", "destination": "Airport", "amount": 85}}'
+                )
+            }]
+        )
+        raw = msg.content[0].text.strip()
+        # Strip markdown code fences if present
+        if raw.startswith('```'):
+            raw = raw.split('```')[1]
+            if raw.startswith('json'):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+    except Exception as e:
+        logger.error(f"Claude parse error: {e}")
+        return None
+
+
+def ask_claude(question):
+    """General Q&A via Claude."""
+    claude = get_claude()
+    if not claude:
+        return "Claude API not configured. Set ANTHROPIC_API_KEY."
+    try:
+        msg = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            system=(
+                "You are NULLCLAW, a smart dispatch assistant for a ride/delivery crew. "
+                "Be concise and practical. You help with job coordination, pricing, "
+                "routing, and crew management questions."
+            ),
+            messages=[{"role": "user", "content": question}]
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"Claude ask error: {e}")
+        return f"Claude error: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -74,23 +164,39 @@ def send_message(chat_id, text, parse_mode='Markdown'):
 # Command handlers
 # ---------------------------------------------------------------------------
 def handle_new_job(message, args_text):
-    """Handle /new <service> \"<name>\" \"<destination>\" <amount>"""
+    """
+    /new <service> \"<name>\" \"<destination>\" <amount>
+    Falls back to Claude for natural language if strict parse fails.
+    """
     chat_id = message['chat']['id']
     user = message['from'].get('username') or message['from'].get('first_name', 'Unknown')
 
+    parsed = None
+
+    # Try strict parse first
     try:
         parts = shlex.split(args_text)
-        if len(parts) < 4:
-            raise ValueError("Not enough arguments")
-        service = parts[0]
-        driver_name = parts[1]
-        destination = parts[2]
-        amount = float(parts[3])
+        if len(parts) >= 4:
+            parsed = {
+                'service': parts[0],
+                'driver': parts[1],
+                'destination': parts[2],
+                'amount': float(parts[3]),
+            }
     except Exception:
+        pass
+
+    # Fall back to Claude if strict parse failed
+    if not parsed and args_text.strip():
+        send_message(chat_id, "\U0001f9e0 Parsing with Claude...")
+        parsed = parse_job_with_claude(args_text)
+
+    if not parsed:
         send_message(
             chat_id,
             "\u274c *Usage:* `/new <service> \"<name>\" \"<destination>\" <amount>`\n"
-            "Example: `/new uber \"Sarah\" \"Airport\" 85`"
+            "Example: `/new uber \"Sarah\" \"Airport\" 85`\n\n"
+            "Or describe naturally: `/new uber job for Sarah going to the airport, $85`"
         )
         return
 
@@ -98,10 +204,10 @@ def handle_new_job(message, args_text):
     job_id = generate_job_id()
     jobs[job_id] = {
         'id': job_id,
-        'service': service,
-        'driver': driver_name,
-        'destination': destination,
-        'amount': amount,
+        'service': parsed['service'],
+        'driver': parsed['driver'],
+        'destination': parsed['destination'],
+        'amount': float(parsed['amount']),
         'status': 'pending',
         'created_at': datetime.utcnow().isoformat(),
         'created_by': user,
@@ -114,10 +220,10 @@ def handle_new_job(message, args_text):
         f"\U0001f680 *NEW JOB POSTED*\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"\U0001f194 `{job_id}`\n"
-        f"\U0001f697 Service: *{service.upper()}*\n"
-        f"\U0001f464 Driver: *{driver_name}*\n"
-        f"\U0001f4cd Destination: *{destination}*\n"
-        f"\U0001f4b0 Amount: *${amount:.2f}*\n"
+        f"\U0001f697 Service: *{parsed['service'].upper()}*\n"
+        f"\U0001f464 Driver: *{parsed['driver']}*\n"
+        f"\U0001f4cd Destination: *{parsed['destination']}*\n"
+        f"\U0001f4b0 Amount: *${float(parsed['amount']):.2f}*\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"To complete: `/complete {job_id}`"
     )
@@ -126,7 +232,6 @@ def handle_new_job(message, args_text):
 
 
 def handle_complete(message, args_text):
-    """Handle /complete <JOB_ID>"""
     chat_id = message['chat']['id']
     user = message['from'].get('username') or message['from'].get('first_name', 'Unknown')
     job_id = args_text.strip().upper()
@@ -167,7 +272,6 @@ def handle_complete(message, args_text):
 
 
 def handle_stats(message):
-    """Handle /stats"""
     chat_id = message['chat']['id']
     jobs = load_jobs()
 
@@ -201,10 +305,8 @@ def handle_stats(message):
 
 
 def handle_list(message):
-    """Handle /list — show last 10 pending jobs"""
     chat_id = message['chat']['id']
     jobs = load_jobs()
-
     pending = {jid: j for jid, j in jobs.items() if j['status'] == 'pending'}
 
     if not pending:
@@ -221,24 +323,41 @@ def handle_list(message):
     send_message(chat_id, "\n".join(lines))
 
 
-def handle_help(message):
-    """Handle /help and /start"""
+def handle_ask(message, args_text):
+    """Handle /ask <question> - powered by Claude"""
     chat_id = message['chat']['id']
+    question = args_text.strip()
+
+    if not question:
+        send_message(chat_id, "\u274c *Usage:* `/ask <your question>`")
+        return
+
+    send_message(chat_id, "\U0001f9e0 Thinking...")
+    answer = ask_claude(question)
+    send_message(chat_id, answer)
+
+
+def handle_help(message):
+    chat_id = message['chat']['id']
+    claude_status = "\u2705 Active" if (CLAUDE_AVAILABLE and ANTHROPIC_API_KEY) else "\u274c Not configured"
     msg = (
         "\U0001f916 *NULLCLAW DISPATCHER*\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         "*Commands:*\n"
         "`/new <service> \"<name>\" \"<dest>\" <amount>`\n"
-        "  Post a new job\n\n"
+        "  Post a job (natural language OK)\n\n"
         "`/complete <JOB_ID>`\n"
         "  Mark a job as complete\n\n"
         "`/stats`\n"
         "  Show earnings & job stats\n\n"
         "`/list`\n"
         "  Show pending jobs\n\n"
+        "`/ask <question>`\n"
+        "  Ask Claude anything\n\n"
         "`/help`\n"
         "  Show this message\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f9e0 Claude AI: {claude_status}\n"
         "*Example:*\n"
         "`/new uber \"Sarah\" \"Airport\" 85`"
     )
@@ -258,7 +377,7 @@ def process_update(update):
         return
 
     parts = text.split(None, 1)
-    command = parts[0].split('@')[0].lower()  # handle /cmd@botname
+    command = parts[0].split('@')[0].lower()
     args = parts[1] if len(parts) > 1 else ''
 
     dispatch = {
@@ -266,6 +385,7 @@ def process_update(update):
         '/complete': lambda: handle_complete(message, args),
         '/stats': lambda: handle_stats(message),
         '/list': lambda: handle_list(message),
+        '/ask': lambda: handle_ask(message, args),
         '/help': lambda: handle_help(message),
         '/start': lambda: handle_help(message),
     }
@@ -273,12 +393,10 @@ def process_update(update):
     handler = dispatch.get(command)
     if handler:
         handler()
-    else:
-        logger.debug(f"Unknown command: {command}")
 
 
 # ---------------------------------------------------------------------------
-# Flask routes (webhook mode)
+# Flask routes
 # ---------------------------------------------------------------------------
 @app.route('/webhook/<token>', methods=['POST'])
 def webhook(token):
@@ -290,9 +408,55 @@ def webhook(token):
     return jsonify({'ok': True})
 
 
+@app.route('/deploy', methods=['POST'])
+def deploy():
+    """
+    Called by GitHub Actions on every push to main.
+    Pulls latest code and reloads the WSGI app.
+    Protected by DEPLOY_SECRET bearer token.
+    """
+    if not DEPLOY_SECRET:
+        return jsonify({'error': 'DEPLOY_SECRET not configured'}), 500
+
+    auth = request.headers.get('Authorization', '')
+    if auth != f'Bearer {DEPLOY_SECRET}':
+        logger.warning("Deploy attempt with invalid secret")
+        return jsonify({'error': 'unauthorized'}), 403
+
+    try:
+        # Pull latest code
+        pull = subprocess.run(
+            ['git', 'pull'],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        logger.info(f"git pull: {pull.stdout.strip()}")
+
+        # Touch WSGI file to trigger PythonAnywhere reload
+        if os.path.exists(WSGI_FILE):
+            os.utime(WSGI_FILE, None)
+            logger.info(f"Touched {WSGI_FILE} to trigger reload")
+        else:
+            logger.warning(f"WSGI file not found at {WSGI_FILE} — reload may not trigger")
+
+        return jsonify({
+            'status': 'ok',
+            'git': pull.stdout.strip() or pull.stderr.strip(),
+        })
+    except Exception as e:
+        logger.error(f"Deploy error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'bot': 'NULLCLAW Dispatcher'})
+    return jsonify({
+        'status': 'ok',
+        'bot': 'NULLCLAW Dispatcher',
+        'claude': CLAUDE_AVAILABLE and bool(ANTHROPIC_API_KEY),
+    })
 
 
 @app.route('/', methods=['GET'])
@@ -301,7 +465,7 @@ def index():
 
 
 # ---------------------------------------------------------------------------
-# Webhook management helpers
+# Webhook management
 # ---------------------------------------------------------------------------
 def set_webhook(webhook_url):
     resp = requests.post(f"{BASE_URL}/setWebhook", json={'url': webhook_url}, timeout=10)
@@ -314,10 +478,10 @@ def delete_webhook():
 
 
 # ---------------------------------------------------------------------------
-# Long-polling mode (for local testing)
+# Long-polling mode (local testing)
 # ---------------------------------------------------------------------------
 def run_polling():
-    logger.info("Starting long-polling mode (delete webhook first)...")
+    logger.info("Long-polling mode — deleting webhook first...")
     delete_webhook()
     offset = None
     while True:
@@ -343,7 +507,7 @@ if __name__ == '__main__':
     import sys
 
     if not TELEGRAM_BOT_TOKEN:
-        print("ERROR: TELEGRAM_BOT_TOKEN environment variable not set.")
+        print("ERROR: TELEGRAM_BOT_TOKEN not set")
         sys.exit(1)
 
     if len(sys.argv) > 1:
@@ -351,15 +515,11 @@ if __name__ == '__main__':
         if cmd == 'polling':
             run_polling()
         elif cmd == 'setwebhook' and len(sys.argv) > 2:
-            result = set_webhook(sys.argv[2])
-            print(f"Webhook result: {result}")
+            print(set_webhook(sys.argv[2]))
         elif cmd == 'deletewebhook':
-            result = delete_webhook()
-            print(f"Delete webhook result: {result}")
+            print(delete_webhook())
         else:
-            print(f"Unknown command: {cmd}")
-            print("Usage: python dispatcher.py [polling | setwebhook <url> | deletewebhook]")
+            print(f"Usage: python dispatcher.py [polling | setwebhook <url> | deletewebhook]")
     else:
-        # Run Flask dev server (webhook mode)
         port = int(os.environ.get('PORT', 5000))
         app.run(host='0.0.0.0', port=port, debug=False)
