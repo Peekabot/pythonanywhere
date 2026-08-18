@@ -1,0 +1,48 @@
+#!/bin/sh
+# Peekagate helper for iSH / POSIX sh
+set -eu
+BASE=${BASE:-https://peekabot.pythonanywhere.com}
+
+usage() {
+  printf '%s\n' "usage: pg state | ping | hw | scripts | search <q> | cmd <json>"
+  exit 1
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+
+post() {
+  curl -sS -X POST "$BASE/api/commands" \
+    -H "Content-Type: application/json" \
+    -d "$1"
+  printf '\n'
+}
+
+case "$cmd" in
+  state)
+    curl -sS "$BASE/api/state"
+    printf '\n'
+    ;;
+  ping)
+    post '{"action":"ping"}'
+    ;;
+  hw|hardware)
+    post '{"action":"hw"}'
+    ;;
+  scripts)
+    post '{"action":"scripts","target":"pythonista"}'
+    ;;
+  search)
+    [ $# -ge 1 ] || usage
+    q=$1
+    post "{\"action\":\"search\",\"q\":\"$q\",\"target\":\"pythonista\"}"
+    ;;
+  cmd)
+    [ $# -ge 1 ] || usage
+    post "$1"
+    ;;
+  *)
+    usage
+    ;;
+esac

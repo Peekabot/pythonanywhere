@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Peekagate iSH node — paths, tools, light hardware. Keep server unchanged."""
+"""Peekagate iSH node — paths, tools, light hardware. LAST persists results."""
 import json, os, platform, shutil, subprocess, time
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +13,8 @@ except ImportError:
 BASE = "https://peekabot.pythonanywhere.com"
 INTERVAL = 20
 ROOT = Path.home()
+LAST = {}
+NODE = "ish"
 
 def sh(cmd, timeout=15):
     try:
@@ -50,15 +52,17 @@ def list_paths(path=".", limit=40):
     return {"path": str(p.resolve()), "entries": items}
 
 def push_state(extra=None):
+    global LAST
+    if extra:
+        LAST.update(extra)
     payload = {
-        "source": "ish",
+        "source": NODE,
         "status": "online",
         "time": datetime.utcnow().isoformat() + "Z",
         "hw": hardware(),
         "note": "ish-node",
     }
-    if extra:
-        payload.update(extra)
+    payload.update(LAST)
     try:
         r = requests.post(f"{BASE}/api/state", json=payload, timeout=12)
         print("\u2191", r.status_code)
@@ -75,8 +79,17 @@ def pull_commands():
         print("\u2193 fail", e)
         return []
 
+def for_me(cmd):
+    t = cmd.get("target")
+    if not t or t in ("all", NODE, "ish"):
+        return True
+    return False
+
 def run_cmd(cmd):
     if not isinstance(cmd, dict):
+        return
+    if not for_me(cmd):
+        print("skip target", cmd.get("target"))
         return
     a = cmd.get("action")
     print("cmd:", a, cmd)
@@ -102,6 +115,10 @@ def run_cmd(cmd):
         push_state({"run": {"cmd": c, "code": code, "out": out[:6000]}})
     elif a == "echo":
         push_state({"last_echo": cmd.get("message")})
+    elif a == "scripts":
+        root = Path.cwd()
+        names = sorted(p.name for p in root.glob("*.py"))
+        push_state({"scripts": names})
     else:
         print("unknown", a)
 
