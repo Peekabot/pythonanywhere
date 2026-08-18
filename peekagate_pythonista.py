@@ -2,7 +2,6 @@
 """Peekagate Pythonista worker — thin poll loop + action dispatch."""
 import requests
 import time
-import os
 import platform
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 BASE = "https://peekabot.pythonanywhere.com"
 INTERVAL = 15
 LAST = {}
+NODE = "pythonista"
 
 def hardware():
     info = {
@@ -85,7 +85,7 @@ def push_state(extra=None):
     if extra:
         LAST.update(extra)
     payload = {
-        "source": "pythonista",
+        "source": NODE,
         "status": "online",
         "time": datetime.utcnow().isoformat() + "Z",
         "hw": hardware(),
@@ -107,6 +107,12 @@ def pull_commands():
     except Exception as e:
         print(f"\u2193 fail {e}")
         return []
+
+def for_me(cmd):
+    t = cmd.get("target")
+    if not t or t in ("all", NODE, "pythonista"):
+        return True
+    return False
 
 def notify(msg):
     try:
@@ -135,6 +141,9 @@ def upload_file(path, tag="general"):
 
 def run_cmd(cmd):
     if not isinstance(cmd, dict):
+        return
+    if not for_me(cmd):
+        print("skip target", cmd.get("target"))
         return
     action = cmd.get("action")
     print("cmd:", action)
