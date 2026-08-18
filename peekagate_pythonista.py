@@ -9,6 +9,7 @@ from pathlib import Path
 
 BASE = "https://peekabot.pythonanywhere.com"
 INTERVAL = 15
+LAST = {}
 
 def hardware():
     info = {
@@ -80,6 +81,9 @@ def search_files(q, max_hits=20):
     return {"search": {"q": q, "hits": hits}}
 
 def push_state(extra=None):
+    global LAST
+    if extra:
+        LAST.update(extra)
     payload = {
         "source": "pythonista",
         "status": "online",
@@ -87,8 +91,7 @@ def push_state(extra=None):
         "hw": hardware(),
         "note": "alive",
     }
-    if extra:
-        payload.update(extra)
+    payload.update(LAST)
     try:
         r = requests.post(f"{BASE}/api/state", json=payload, timeout=12)
         print(f"\u2191 {r.status_code}")
