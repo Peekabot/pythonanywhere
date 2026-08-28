@@ -11,6 +11,7 @@ STATE_FILE = f"{BASE_DIR}/state.json"
 CMD_FILE = f"{BASE_DIR}/commands.json"
 FILES_DIR = f"{BASE_DIR}/files"
 os.makedirs(FILES_DIR, exist_ok=True)
+LEDGER_TOKEN = os.environ.get("GENOME_LEDGER_TOKEN", "")
 
 # ===== HELPERS =====
 def load(path, default):
@@ -42,6 +43,12 @@ def list_files(tag=None, limit=50):
                     files.append(meta)
     files.sort(key=lambda x: x.get("uploaded", ""), reverse=True)
     return files[:limit]
+
+def ledger_ok():
+    if not LEDGER_TOKEN:
+        return True
+    got = request.headers.get("X-Ledger-Token") or request.args.get("token") or ""
+    return got == LEDGER_TOKEN
 
 # ===== DASHBOARD =====
 @app.route("/")
@@ -200,6 +207,50 @@ def commands():
     cmds.append(data)
     save(CMD_FILE, cmds)
     return jsonify({"ok": True, "queued": len(cmds)})
+
+# ===== IMMUTABLE GENOME LEDGER =====
+@app.route("/v1/events", methods=["GET", "POST"])
+def v1_events():
+    if not ledger_ok():
+        return jsonify({"error": "token"}), 401
+    import ledger
+    if request.method == "GET":
+        kind = request.args.get("kind")
+        limit = request.args.get("limit", 50)
+        return jsonify({"events": ledger.list_events(kind, limit)})
+    data = request.get_json(silent=True) or {}
+    kind = (data.get("kind") or "note").strip()[:40]
+    source = (data.get("source") or request.headers.get("X-Source") or "unknown").strip()[:40]
+    payload = data.get("payload")
+    if payload is None:
+        payload = {k: data[k] for k in data if k not in ("kind", "source")}
+    rec = ledger.append(kind, payload, source)
+    return jsonify({"ok": True, "event": rec}), 201
+
+@app.route("/v1/events/<int:eid>", methods=["GET"])
+def v1_event(eid):
+    if not ledger_ok():
+        return jsonify({"error": "token"}), 401
+    import ledger
+    rec = ledger.get_event(eid)
+    if not rec:
+        return jsonify({"error": "missing"}), 404
+    return jsonify(rec)
+
+@app.route("/v1/head", methods=["GET"])
+def v1_head():
+    if not ledger_ok():
+        return jsonify({"error": "token"}), 401
+    import ledger
+    events = ledger.list_events(None, 1)
+    return jsonify(events[0] if events else {"hash": "genesis", "id": None})
+
+@app.route("/v1/verify", methods=["GET"])
+def v1_verify():
+    if not ledger_ok():
+        return jsonify({"error": "token"}), 401
+    import ledger
+    return jsonify(ledger.verify_chain())
 
 if __name__ == "__main__":
     app.run()
